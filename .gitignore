@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.json
+!package.json
+.env
+
+# scan reports
+*.csv
+*.html
