@@ -38,7 +38,7 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-__version__ = "2.0"
+__version__ = "2.0.0"
 
 # ── Windows console support ───────────────────────────────────────────────────
 if os.name == "nt":

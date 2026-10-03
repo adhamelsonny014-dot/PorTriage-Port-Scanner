@@ -2,9 +2,49 @@
 
 **Scan. Rank. Fix first.**
 
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Requires nmap](https://img.shields.io/badge/requires-nmap-informational)](https://nmap.org/)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#requirements)
+
+> **nmap tells you what's open. PorTriage tells you what to fix first.**
+
 PorTriage (*port* + *triage*) is a Python command-line tool that scans a host (or network range) with **nmap**, fingerprints the services running on open ports, and then checks each service against several live vulnerability databases and the **Exploit-DB** archive to show which known CVEs and public exploits may apply. Findings are ranked using **CISA KEV** (vulnerabilities attackers are actively exploiting) and **FIRST EPSS** (probability of exploitation), so you know what to fix first.
 
 > ⚠️ **Legal notice:** Only scan systems you own or have explicit written permission to test. Unauthorized port scanning may be illegal in your jurisdiction.
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/adhamelsonny014-dot/PorTriage-Port-Scanner.git
+cd PorTriage-Port-Scanner
+pip install -r requirements.txt          # plus nmap itself — see Requirements
+
+# scanme.nmap.org is provided by the nmap project for test scans
+python portriage.py scanme.nmap.org --top-ports 100 --html report.html
+```
+
+---
+
+## Why PorTriage?
+
+A version scan gives you a list of services. Turning that into "what do I patch first?" usually means looking up every version by hand. PorTriage does that step for you and puts the result in order.
+
+| | `nmap -sV` | `nmap --script vulners` | **PorTriage** |
+|---|:---:|:---:|:---:|
+| Open ports & service versions | ✅ | ✅ | ✅ |
+| Versions matched to CVEs | — | ✅ Vulners | ✅ NVD + OSV (+ Vulners) |
+| Public exploits from Exploit-DB, with links | — | flags some | ✅ via searchsploit |
+| Flags CVEs exploited in the wild (CISA KEV) | — | — | ✅ |
+| Exploit probability (FIRST EPSS) | — | — | ✅ |
+| Ranked "fix first" list & per-host risk | — | — | ✅ |
+| HTML / CSV reports | — | — | ✅ |
+| Compare with a previous scan | via `ndiff` | — | ✅ `--compare` |
+| Exit code for CI / cron | — | — | ✅ `--fail-on` |
+
+**What it isn't:** PorTriage matches *versions* to known CVEs — it doesn't log in to hosts, test web apps, or confirm that a vulnerability is exploitable. For authenticated or in-depth assessments use a full scanner such as OpenVAS/Greenbone or Nessus; PorTriage is the fast, lightweight first pass.
 
 ---
 
@@ -22,7 +62,7 @@ PorTriage (*port* + *triage*) is a Python command-line tool that scans a host (o
   - [FIRST EPSS](https://www.first.org/epss/) — the probability a CVE will be exploited in the next 30 days
   - A **"Fix first"** list ranks findings by KEV → CVSS → EPSS, and every host gets an overall **risk rating**
 - **Exploit discovery** via `searchsploit` (offline Exploit-DB mirror), with direct exploit-db.com links
-- **Smart CPE handling** — converts nmap's CPE 2.2 URIs to the CPE 2.3 format NVD requires, and builds CPEs for ~30 common products (Apache, nginx, OpenSSH, MySQL, Redis, Tomcat, …) when nmap does not report one
+- **Smart CPE handling** — converts nmap's CPE 2.2 URIs to the CPE 2.3 format NVD requires, and builds CPEs for ~45 common products (Apache, nginx, OpenSSH, MySQL, Redis, Tomcat, …) when nmap does not report one
 - **De-duplicated, CVSS-sorted results** with severity ratings (CRITICAL / HIGH / MEDIUM / LOW); CVSS v3 vectors from OSV are converted to base scores
 - **Fast enrichment**
   - Each distinct service is looked up **once**, even if it runs on many hosts (e.g. the same OpenSSH across a /24)
@@ -242,6 +282,18 @@ One row per finding (`cve`, `exploit`, or `open-port` for ports without findings
 - Without an NVD key, the first scan of many different services is slow because of NVD's public rate limit (repeat services and re-scans are served from the cache).
 - Lookup results are cached for 24 h by default in `~/.cache/portriage/` (`%LOCALAPPDATA%` on Windows). Use `--no-cache` or `--cache-ttl` to change this.
 - `searchsploit` is a Linux/macOS tool; on Windows run the scanner from WSL to get Exploit-DB results.
+
+---
+
+## Contributing & security
+
+Bug reports, feature ideas and pull requests are welcome — please open an issue. To report a security problem in PorTriage itself, see [SECURITY.md](SECURITY.md).
+
+---
+
+## License
+
+[MIT](LICENSE) © 2026 Adham Elsonny
 
 ---
 
