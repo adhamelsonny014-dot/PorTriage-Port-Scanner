@@ -289,8 +289,9 @@ One row per finding (`cve`, `exploit`, or `open-port` for ports without findings
 
 ## Known limitations
 
-- Vulnerability matching is based on the product/version string nmap reports, so results can include **false positives** (or miss issues if the version is not detected). Backported distro patches are not detected — e.g. an Ubuntu OpenSSH may be patched even though its upstream version is listed as vulnerable. Always verify findings manually.
-- OSV results come from distro advisories, whose version numbering can differ from upstream, so they are noisier than NVD's.
+- Vulnerability matching is based on the product/version string nmap reports, so results can include **false positives** (or miss issues if the version is not detected). Always verify findings manually.
+- **Backported patches** are only detected for Ubuntu and Debian packages whose build nmap reports (e.g. `OpenSSH 8.2p1 Ubuntu 4ubuntu0.4`): PorTriage then checks OSV results against that exact package version, using the distro's own advisories. For other systems, NVD results and upstream-version matches may flag CVEs a distro has already patched.
+- OSV advisories are re-checked against their affected version ranges (Debian/Ubuntu version rules, epochs included). Records without usable version ranges are kept, so a few OSV results may still be broader than the real affected range.
 - Without an NVD key, the first scan of many different services is slow because of NVD's public rate limit (repeat services and re-scans are served from the cache).
 - Lookup results are cached for 24 h by default in `~/.cache/portriage/` (`%LOCALAPPDATA%` on Windows). Use `--no-cache` or `--cache-ttl` to change this.
 - `searchsploit` is a Linux/macOS tool; on Windows run the scanner from WSL to get Exploit-DB results.

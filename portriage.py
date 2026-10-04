@@ -464,7 +464,180 @@ OSV_PACKAGE_NAMES = {
     "bind":         "bind9",
 }
 
-def osv_search(product: str, version: str, max_results: int = 15, cpe: str = "") -> list[dict]:
+# ── Version matching for OSV records ──────────────────────────────────────────
+# OSV compares the queried version using each ecosystem's own rules. Debian and
+# Ubuntu package versions carry an epoch ('1:8.2p1-4ubuntu0.4'), so a bare
+# upstream version like '8.2p1' sorts *below* every fixed version and OSV
+# reports ancient CVEs as affecting it. PorTriage therefore re-checks every
+# record's affected ranges itself.
+
+def _dpkg_order(c: str) -> int:
+    if c == "~":
+        return -1
+    if not c or c.isdigit():
+        return 0
+    if c.isalpha():
+        return ord(c)
+    return ord(c) + 256
+
+def _dpkg_verrevcmp(a: str, b: str) -> int:
+    """dpkg's comparison of an upstream version or revision string."""
+    i = j = 0
+    while i < len(a) or j < len(b):
+        while (i < len(a) and not a[i].isdigit()) or (j < len(b) and not b[j].isdigit()):
+            ac = _dpkg_order(a[i]) if i < len(a) else 0
+            bc = _dpkg_order(b[j]) if j < len(b) else 0
+            if ac != bc:
+                return ac - bc
+            i += 1
+            j += 1
+        while i < len(a) and a[i] == "0":
+            i += 1
+        while j < len(b) and b[j] == "0":
+            j += 1
+        first_diff = 0
+        while i < len(a) and a[i].isdigit() and j < len(b) and b[j].isdigit():
+            if not first_diff:
+                first_diff = ord(a[i]) - ord(b[j])
+            i += 1
+            j += 1
+        if i < len(a) and a[i].isdigit():
+            return 1
+        if j < len(b) and b[j].isdigit():
+            return -1
+        if first_diff:
+            return first_diff
+    return 0
+
+def split_pkg_version(v: str) -> tuple[int, str, str]:
+    """'1:8.2p1-4ubuntu0.4' → (1, '8.2p1', '4ubuntu0.4')."""
+    epoch = 0
+    if ":" in v:
+        e, rest = v.split(":", 1)
+        if e.isdigit():
+            epoch, v = int(e), rest
+    upstream, _, revision = v.rpartition("-") if "-" in v else (v, "", "")
+    return epoch, upstream, revision
+
+def dpkg_compare(a: str, b: str) -> int:
+    """Compare two Debian/Ubuntu package versions (<0, 0, >0), like dpkg."""
+    ea, ua, ra = split_pkg_version(a)
+    eb, ub, rb = split_pkg_version(b)
+    if ea != eb:
+        return ea - eb
+    return _dpkg_verrevcmp(ua, ub) or _dpkg_verrevcmp(ra, rb)
+
+def upstream_compare(a: str, b: str) -> int:
+    """Compare only the upstream parts, ignoring epochs and distro revisions."""
+    return _dpkg_verrevcmp(split_pkg_version(a)[1], split_pkg_version(b)[1])
+
+def _in_ranges(ranges: list, version: str, cmp) -> bool | None:
+    """Evaluate OSV ECOSYSTEM/SEMVER ranges. None if none can be evaluated."""
+    verdict = None
+    for rng in ranges:
+        if rng.get("type") not in ("ECOSYSTEM", "SEMVER"):
+            continue
+        verdict = verdict or False
+        intro = None
+        for ev in rng.get("events", []):
+            if "introduced" in ev:
+                intro = ev["introduced"]
+            elif "fixed" in ev or "last_affected" in ev:
+                if intro is not None:
+                    lo = intro == "0" or cmp(version, intro) >= 0
+                    hi = (cmp(version, ev["fixed"]) < 0 if "fixed" in ev
+                          else cmp(version, ev["last_affected"]) <= 0)
+                    if lo and hi:
+                        return True
+                intro = None
+        if intro is not None and (intro == "0" or cmp(version, intro) >= 0):
+            return True  # introduced, never fixed
+    return verdict
+
+def _entry_versions(entry: dict) -> list[str]:
+    """Every concrete version an OSV 'affected' entry mentions."""
+    out = [v for v in entry.get("versions", [])]
+    for rng in entry.get("ranges", []):
+        for ev in rng.get("events", []):
+            out += [v for k, v in ev.items() if k in ("introduced", "fixed", "last_affected")]
+    return [v for v in out if v and v != "0"]
+
+def distro_package(version_raw: str) -> tuple[str, str] | None:
+    """nmap reports distro builds as '8.2p1 Ubuntu 4ubuntu0.4' or
+    '9.2p1 Debian 2+deb12u3' → ('Ubuntu', '4ubuntu0.4')."""
+    m = re.match(r"\S+\s+(Ubuntu|Debian)\s+(\S+)", version_raw or "")
+    return (m.group(1), m.group(2)) if m else None
+
+def _distro_verdict(entries: list[dict], upstream: str, revision: str) -> bool:
+    """Decide from the host's own distro advisories, using its exact package
+    version. Advisories for other releases of the distro ship a different
+    upstream version and are ignored, so backported fixes are respected."""
+    for entry in entries:
+        mentioned = _entry_versions(entry)
+        same = [v for v in mentioned if split_pkg_version(v)[1] == upstream]
+        has_fix = any("fixed" in ev or "last_affected" in ev
+                      for r in entry.get("ranges", []) for ev in r.get("events", []))
+        if not same and (has_fix or entry.get("versions")):
+            continue  # this advisory is about another release of the distro
+        epoch = split_pkg_version(same[0])[0] if same else 0
+        full  = f"{epoch}:{upstream}-{revision}" if epoch else f"{upstream}-{revision}"
+        if full in entry.get("versions", []):
+            return True
+        if _in_ranges(entry.get("ranges", []), full, dpkg_compare):
+            return True
+    return False
+
+def _record_verdict(record: dict, name: str, upstream: str) -> bool | None:
+    """Upstream-only check of one OSV record. None if it can't be evaluated."""
+    verdicts = []
+    for entry in record.get("affected", []):
+        pkg = entry.get("package", {}).get("name", "").lower()
+        if pkg and pkg != name:
+            continue
+        if any(split_pkg_version(v)[1] == upstream for v in entry.get("versions", [])):
+            return True
+        verdicts.append(_in_ranges(entry.get("ranges", []), upstream, upstream_compare))
+    if True in verdicts:
+        return True
+    if verdicts and all(v is False for v in verdicts):
+        return False
+    return None
+
+def osv_filter(records: list[dict], name: str, version: str,
+               distro: tuple[str, str] | None = None) -> list[dict]:
+    """Keep only the OSV records whose affected ranges really include *version*.
+    With a known distro build (*distro* = ('Ubuntu', '4ubuntu0.4')) the host's
+    own distro advisories decide; otherwise upstream versions are compared."""
+    upstream = split_pkg_version(version)[1]
+    groups: dict[str, list[dict]] = {}
+    for r in records:
+        groups.setdefault(_osv_cve_id(r), []).append(r)
+
+    kept = []
+    for recs in groups.values():
+        if distro:
+            entries = [e for r in recs for e in r.get("affected", [])
+                       if e.get("package", {}).get("ecosystem", "").startswith(distro[0])
+                       and e.get("package", {}).get("name", "").lower() in ("", name)]
+            if entries:
+                if _distro_verdict(entries, upstream, distro[1]):
+                    kept += recs
+                continue
+        kept += [r for r in recs if _record_verdict(r, name, upstream) is not False]
+    return kept
+
+def _osv_cve_id(v: dict) -> str:
+    # Some advisories (e.g. Azure Linux "AZL-…") only name the CVE at the
+    # start of their summary: "CVE-2023-28531 affecting package openssh …"
+    ids = [v.get("id", "")] + v.get("aliases", []) + v.get("upstream", [])
+    cve_id = next((m.group(0) for i in ids if (m := re.search(r"CVE-\d{4}-\d+", i))), None)
+    if not cve_id:
+        m      = re.match(r"CVE-\d{4}-\d+", v.get("summary", ""))
+        cve_id = m.group(0) if m else v.get("id", "N/A")
+    return cve_id
+
+def osv_search(product: str, version: str, max_results: int = 15, cpe: str = "",
+               distro: tuple[str, str] | None = None) -> list[dict]:
     """Query OSV across all ecosystems for this package name + version.
     Distro advisories for the same CVE are merged, scored from their CVSS v3
     vector, and the highest-scoring *max_results* are returned.
@@ -489,18 +662,11 @@ def osv_search(product: str, version: str, max_results: int = 15, cpe: str = "")
             log(dim(f"  [OSV] Error: {e}"))
             return None
 
-    vulns = cached(f"osv:{name}:{version}", fetch) or []
+    vulns = osv_filter(cached(f"osv:{name}:{version}", fetch) or [], name, version, distro)
 
     by_cve: dict[str, dict] = {}
     for v in vulns:
-        # Some advisories (e.g. Azure Linux "AZL-…") only name the CVE at the
-        # start of their summary: "CVE-2023-28531 affecting package openssh …"
-        ids    = [v.get("id", "")] + v.get("aliases", []) + v.get("upstream", [])
-        cve_id = next((m.group(0) for i in ids if (m := re.search(r"CVE-\d{4}-\d+", i))),
-                      None)
-        if not cve_id:
-            m      = re.match(r"CVE-\d{4}-\d+", v.get("summary", ""))
-            cve_id = m.group(0) if m else v.get("id", "N/A")
+        cve_id = _osv_cve_id(v)
         vector = next((s["score"] for s in v.get("severity", [])
                        if s.get("type") == "CVSS_V3"), "")
         score  = cvss3_base_score(vector) if vector else None
@@ -798,7 +964,7 @@ def service_signature(port: dict) -> tuple:
     """Ports with the same signature get identical lookup results, so each
     distinct service is only looked up once per scan."""
     return (port.get("product", "").lower(),
-            clean_version(port.get("version_raw", "")),
+            " ".join(port.get("version_raw", "").split()),  # distro builds differ
             port.get("cpe", ""))
 
 def lookup_service(port_data: dict, opts: LookupOptions) -> tuple[list, list, bool]:
@@ -828,7 +994,8 @@ def lookup_service(port_data: dict, opts: LookupOptions) -> tuple[list, list, bo
 
     # ── OSV lookup ─────────────────────────────────────────────────────────
     if opts.use_osv and product and version and not STOP.is_set():
-        add(osv_search(product, version, cpe=cpe))
+        add(osv_search(product, version, cpe=cpe,
+                       distro=distro_package(port_data.get("version_raw", ""))))
 
     # ── Vulners lookup ─────────────────────────────────────────────────────
     if opts.vulners_key and product and version and not STOP.is_set():
