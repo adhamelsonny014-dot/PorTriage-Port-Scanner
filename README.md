@@ -9,6 +9,10 @@
 
 > **nmap tells you what's open. PorTriage tells you what to fix first.**
 
+<p align="center">
+  <img src="docs/fix-first.png" alt="PorTriage summary: severity breakdown and a ranked Fix-first list with CISA KEV badges and EPSS scores" width="850">
+</p>
+
 PorTriage (*port* + *triage*) is a Python command-line tool that scans a host (or network range) with **nmap**, fingerprints the services running on open ports, and then checks each service against several live vulnerability databases and the **Exploit-DB** archive to show which known CVEs and public exploits may apply. Findings are ranked using **CISA KEV** (vulnerabilities attackers are actively exploiting) and **FIRST EPSS** (probability of exploitation), so you know what to fix first.
 
 > ⚠️ **Legal notice:** Only scan systems you own or have explicit written permission to test. Unauthorized port scanning may be illegal in your jurisdiction.
@@ -224,6 +228,14 @@ The tool works without any keys, using NVD, OSV, CISA KEV and EPSS. Keys can be 
 ## Output
 
 ### Terminal report
+
+<p align="center">
+  <img src="docs/enrichment.png" alt="PorTriage scanning a host and looking up each service against NVD, OSV, CISA KEV, EPSS and SearchSploit" width="850">
+</p>
+
+<p align="center">
+  <img src="docs/report.png" alt="PorTriage report: open ports table with findings, and CVE details with CVSS, EPSS and links" width="850">
+</p>
 
 For each host the report shows an overall risk rating, the OS guess (with `-O`), and a table of open ports with their service, version and findings. Each affected port is then detailed: every CVE shows its severity, CVSS score, ID, **KEV** badge, **EPSS** probability, source, a short description, publish date and link; each exploit shows its EDB-ID, type, title and Exploit-DB URL. The summary at the end has a severity bar chart and a **"Fix first"** list of the most urgent CVEs.
 
