@@ -181,6 +181,14 @@ def clean_version(version: str) -> str:
     the upstream version is the first token."""
     return version.split()[0] if version else ""
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+def clean_text(s) -> str:
+    """Strip control characters (terminal escape sequences, newlines, ...) from
+    text that came from a scanned host, so a hostile banner or reverse-DNS name
+    can't tamper with the terminal or the reports."""
+    return _CONTROL_CHARS.sub(" ", str(s)).strip()
+
 def short_desc(desc: str, limit: int = 500) -> str:
     desc = " ".join(desc.split())
     return desc[:limit] + ("…" if len(desc) > limit else "")
@@ -368,11 +376,128 @@ NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
 _nvd_limiter = RateLimiter()
 
-def _nvd_get(params: dict, nvd_key: str = "", label: str = "query") -> list[dict] | None:
+# ── NVD applicability ─────────────────────────────────────────────────────────
+# NVD records *where* a CVE applies as "configurations": a product with a
+# version range, sometimes combined with "AND running on <operating system>".
+# NVD's keyword search ignores all of that, and its CPE search ignores the
+# platform part, so PorTriage evaluates the configurations itself.
+
+OS_FAMILY = {
+    "canonical": "ubuntu", "ubuntu": "ubuntu", "debian": "debian",
+    "redhat": "redhat", "centos": "redhat", "rocky": "redhat", "almalinux": "redhat",
+    "fedoraproject": "fedora", "fedora": "fedora", "suse": "suse", "opensuse": "suse",
+    "alpinelinux": "alpine", "microsoft": "windows", "freebsd": "freebsd",
+    "linux": "linux",
+}
+# Platform families a host with a given OS hint satisfies (all of these are Linux)
+HINT_SATISFIES = {
+    "ubuntu": {"ubuntu", "linux"}, "debian": {"debian", "linux"},
+    "redhat": {"redhat", "linux"}, "fedora": {"fedora", "linux"},
+    "suse": {"suse", "linux"}, "alpine": {"alpine", "linux"},
+    "windows": {"windows"}, "freebsd": {"freebsd"},
+}
+OS_HINTS = (
+    ("ubuntu",  r"\bubuntu\b"),
+    ("debian",  r"\bdebian\b"),
+    ("redhat",  r"\b(?:red ?hat|rhel|centos|rocky|alma ?linux)\b"),
+    ("fedora",  r"\bfedora\b"),
+    ("suse",    r"\bsuse\b"),
+    ("alpine",  r"\balpine\b"),
+    ("windows", r"\b(?:windows|win32|win64)\b"),
+    ("freebsd", r"\bfreebsd\b"),
+)
+
+def _banner_hint(text: str) -> str:
+    return next((name for name, pat in OS_HINTS if re.search(pat, text, re.I)), "")
+
+def os_hint(port: dict) -> str:
+    """The host's OS family: shared from the host's other ports (see
+    enrich_results) or named in this port's own banner ('Apache httpd 2.4.48
+    (Ubuntu)' → 'ubuntu'); '' when unknown."""
+    return port.get("os_hint") or _banner_hint(f"{port.get('product', '')} {port.get('version', '')}")
+
+def cpe_context(cpe: str) -> tuple[str, str, str] | None:
+    """(vendor, product, version) of a version-specific CPE 2.3 application name.
+    NVD writes OpenSSH 8.2p1 as version '8.2' + update 'p1', so both are joined."""
+    f = cpe.split(":")
+    if len(f) > 6 and f[2] == "a" and f[3] not in ("", "*") and f[4] not in ("", "*"):
+        ver = f[5] + (f[6] if f[6] not in ("*", "-", "") else "")
+        if ver not in ("", "*", "-"):
+            return f[3], f[4], ver
+    return None
+
+def _cpe_match_covers(m: dict, version: str) -> bool:
+    """Does one NVD cpeMatch entry (exact version or version range) cover *version*?"""
+    f   = m.get("criteria", "").split(":")
+    cv  = f[5] if len(f) > 5 else "*"
+    upd = f[6] if len(f) > 6 else "*"
+    lo_inc, lo_exc = m.get("versionStartIncluding"), m.get("versionStartExcluding")
+    hi_inc, hi_exc = m.get("versionEndIncluding"), m.get("versionEndExcluding")
+    if lo_inc or lo_exc or hi_inc or hi_exc:
+        return not ((lo_inc and _dpkg_verrevcmp(version, lo_inc) < 0)
+                    or (lo_exc and _dpkg_verrevcmp(version, lo_exc) <= 0)
+                    or (hi_inc and _dpkg_verrevcmp(version, hi_inc) > 0)
+                    or (hi_exc and _dpkg_verrevcmp(version, hi_exc) >= 0))
+    if cv == "*":
+        return True
+    if cv == "-":
+        return False
+    return _dpkg_verrevcmp(version, cv + (upd if upd not in ("*", "-", "") else "")) == 0
+
+def nvd_applicability(configs: list, ctx: tuple[str, str, str]) -> tuple[bool | None, list]:
+    """Evaluate a CVE's NVD configurations for one product version.
+    Returns (verdict, platforms): verdict is True (applies), False (the version is
+    outside every affected range) or None (NVD has no usable data for this
+    product). platforms lists the OS families the matching configurations
+    require ('running on Red Hat'); [] if any matching configuration has none."""
+    vendor, product, version = ctx
+    saw_product = matched = unconstrained = False
+    platforms: list[list[str]] = []
+    for conf in configs:
+        nodes   = conf.get("nodes", [])
+        hit     = False
+        for node in nodes:
+            for m in node.get("cpeMatch", []):
+                f = m.get("criteria", "").split(":")
+                if m.get("vulnerable") and len(f) > 5 and f[3] == vendor and f[4] == product:
+                    saw_product = True
+                    hit = hit or _cpe_match_covers(m, version)
+        if not hit:
+            continue
+        matched = True
+        needs: set[str] = set()
+        if conf.get("operator") == "AND":
+            for node in nodes:
+                for m in node.get("cpeMatch", []):
+                    f = m.get("criteria", "").split(":")
+                    if not m.get("vulnerable") and len(f) > 3 and f[2] in ("o", "h"):
+                        needs.add(OS_FAMILY.get(f[3], f[3]))
+        if needs:
+            platforms.append(sorted(needs))
+        else:
+            unconstrained = True
+    if not saw_product:
+        return None, []
+    if not matched:
+        return False, []
+    return True, ([] if unconstrained else platforms)
+
+def platform_ok(vuln: dict, hint: str) -> bool:
+    """False when the CVE only applies on operating systems other than the host's."""
+    platforms = vuln.get("platforms")
+    if not platforms or not hint:
+        return True
+    ok = HINT_SATISFIES.get(hint, {hint})
+    return any(ok & set(p) for p in platforms)
+
+def _nvd_get(params: dict, nvd_key: str = "", label: str = "query",
+             ctx: tuple[str, str, str] | None = None) -> list[dict] | None:
     """GET the NVD CVE API, respecting its rate limits.
     Public limit: 5 requests / 30 s; with an API key: 50 requests / 30 s.
-    Returns parsed results ([] if NVD doesn't know the CPE/query), or None on error."""
-    key = "nvd:" + json.dumps(params, sort_keys=True)
+    Returns parsed results ([] if NVD doesn't know the CPE/query), or None on error.
+    With *ctx* (vendor, product, version), CVEs whose affected ranges exclude
+    that version are dropped."""
+    key = "nvd2:" + json.dumps([params, ctx], sort_keys=True)
     hit = cache.get(key)
     if hit is not None:
         return hit
@@ -389,7 +514,7 @@ def _nvd_get(params: dict, nvd_key: str = "", label: str = "query") -> list[dict
             return None
         if r.status_code == 200:
             try:
-                results = _parse_nvd_response(r.json())
+                results = _parse_nvd_response(r.json(), ctx)
             except ValueError:
                 log(dim(f"  [NVD] {label}: invalid JSON response"))
                 return None
@@ -408,29 +533,38 @@ def _nvd_get(params: dict, nvd_key: str = "", label: str = "query") -> list[dict
         return None
     return None
 
-def nvd_search_by_keyword(keyword: str, nvd_key: str = "", max_results: int = 200) -> list[dict]:
-    """Search NVD descriptions by keyword (e.g. 'OpenSSH 8.9p1')."""
+def nvd_search_by_keyword(keyword: str, nvd_key: str = "", max_results: int = 200,
+                          ctx: tuple[str, str, str] | None = None) -> list[dict]:
+    """Search NVD descriptions by keyword (e.g. 'OpenSSH 8.9p1'). A keyword hit
+    only means the text mentions the product, so *ctx* is used to check it."""
     params = {"keywordSearch": keyword, "resultsPerPage": max_results}
-    return _nvd_get(params, nvd_key, "keyword search") or []
+    return _nvd_get(params, nvd_key, "keyword search", ctx) or []
 
-def nvd_search_by_cpe(cpe: str, nvd_key: str = "", max_results: int = 2000) -> list[dict]:
+def nvd_search_by_cpe(cpe: str, nvd_key: str = "", max_results: int = 2000,
+                      ctx: tuple[str, str, str] | None = None) -> list[dict]:
     """Search NVD by CPE 2.3 string — most precise method.
     Tries an exact dictionary match (cpeName) first, then a match against the
     CVEs' own applicability criteria (virtualMatchString), which also works for
     versions that aren't in the CPE dictionary, e.g. OpenSSH '8.9p1'.
     2000 is NVD's page maximum, so one request returns every match."""
+    ctx = ctx or cpe_context(cpe)
     for param in ("cpeName", "virtualMatchString"):
         results = _nvd_get({param: cpe, "resultsPerPage": max_results},
-                           nvd_key, "CPE search")
+                           nvd_key, "CPE search", ctx)
         if results:
             return results
     return []
 
-def _parse_nvd_response(data: dict) -> list[dict]:
+def _parse_nvd_response(data: dict, ctx: tuple[str, str, str] | None = None) -> list[dict]:
     results = []
     for item in data.get("vulnerabilities", []):
         cve    = item.get("cve", {})
         cve_id = cve.get("id", "N/A")
+        platforms: list = []
+        if ctx and cve.get("configurations"):
+            verdict, platforms = nvd_applicability(cve["configurations"], ctx)
+            if verdict is False:
+                continue  # NVD's own affected-version ranges exclude this version
         desc   = next(
             (d["value"] for d in cve.get("descriptions", []) if d["lang"] == "en"),
             "No description."
@@ -443,7 +577,7 @@ def _parse_nvd_response(data: dict) -> list[dict]:
                 score  = m["cvssData"].get("baseScore", "N/A")
                 vector = m["cvssData"].get("vectorString", "N/A")
                 break
-        results.append({
+        entry = {
             "source":      "NVD",
             "cve":         cve_id,
             "severity":    cvss_to_severity(score),
@@ -451,7 +585,10 @@ def _parse_nvd_response(data: dict) -> list[dict]:
             "vector":      vector,
             "published":   cve.get("published", "")[:10],
             "description": short_desc(desc),
-        })
+        }
+        if platforms:
+            entry["platforms"] = platforms  # consumed by platform_ok(), then dropped
+        results.append(entry)
     return results
 
 # ── 2. OSV.dev — Google Open Source Vulnerability DB ──────────────────────────
@@ -531,9 +668,20 @@ def upstream_compare(a: str, b: str) -> int:
     """Compare only the upstream parts, ignoring epochs and distro revisions."""
     return _dpkg_verrevcmp(split_pkg_version(a)[1], split_pkg_version(b)[1])
 
-def _in_ranges(ranges: list, version: str, cmp) -> bool | None:
-    """Evaluate OSV ECOSYSTEM/SEMVER ranges. None if none can be evaluated."""
+# Distro advisories say "introduced: 0" for "since this package existed in the
+# distro", NOT "since the first upstream release" — so for a bare upstream
+# version they prove nothing (e.g. Debian's apache2 CVE-2021-41773 entry reads
+# 'introduced 0, fixed 2.4.51-1', yet upstream 2.4.48 predates the bug).
+DISTRO_ECOSYSTEMS = ("debian", "ubuntu", "alpine", "red hat", "rocky", "almalinux",
+                     "suse", "opensuse", "mageia", "photon", "azure linux", "cbl-mariner",
+                     "chainguard", "wolfi", "openeuler", "echo", "minimos", "bellsoft")
+
+def _in_ranges(ranges: list, version: str, cmp, zero_unconfirmed: bool = False):
+    """Evaluate OSV ECOSYSTEM/SEMVER ranges: True (affected), False, None (no range
+    could be evaluated) or "zero" (only an 'introduced: 0' range matches and
+    *zero_unconfirmed* says not to take that literally)."""
     verdict = None
+    zero    = False
     for rng in ranges:
         if rng.get("type") not in ("ECOSYSTEM", "SEMVER"):
             continue
@@ -548,11 +696,17 @@ def _in_ranges(ranges: list, version: str, cmp) -> bool | None:
                     hi = (cmp(version, ev["fixed"]) < 0 if "fixed" in ev
                           else cmp(version, ev["last_affected"]) <= 0)
                     if lo and hi:
-                        return True
+                        if intro == "0" and zero_unconfirmed:
+                            zero = True
+                        else:
+                            return True
                 intro = None
         if intro is not None and (intro == "0" or cmp(version, intro) >= 0):
-            return True  # introduced, never fixed
-    return verdict
+            if intro == "0" and zero_unconfirmed:
+                zero = True
+            else:
+                return True  # introduced, never fixed
+    return "zero" if zero else verdict
 
 def _entry_versions(entry: dict) -> list[str]:
     """Every concrete version an OSV 'affected' entry mentions."""
@@ -596,12 +750,14 @@ def _record_verdict(record: dict, name: str, upstream: str) -> bool | None:
             continue
         if any(split_pkg_version(v)[1] == upstream for v in entry.get("versions", [])):
             return True
-        verdicts.append(_in_ranges(entry.get("ranges", []), upstream, upstream_compare))
+        distro = entry.get("package", {}).get("ecosystem", "").lower().startswith(DISTRO_ECOSYSTEMS)
+        verdicts.append(_in_ranges(entry.get("ranges", []), upstream, upstream_compare,
+                                   zero_unconfirmed=distro))
     if True in verdicts:
         return True
-    if verdicts and all(v is False for v in verdicts):
-        return False
-    return None
+    if None in verdicts or not verdicts:
+        return None  # nothing here can rule it out
+    return False  # out of range, or only an unconfirmable 'introduced: 0' range
 
 def osv_filter(records: list[dict], name: str, version: str,
                distro: tuple[str, str] | None = None) -> list[dict]:
@@ -965,7 +1121,8 @@ def service_signature(port: dict) -> tuple:
     distinct service is only looked up once per scan."""
     return (port.get("product", "").lower(),
             " ".join(port.get("version_raw", "").split()),  # distro builds differ
-            port.get("cpe", ""))
+            port.get("cpe", ""),
+            os_hint(port))
 
 def lookup_service(port_data: dict, opts: LookupOptions) -> tuple[list, list, bool]:
     """Query all CVE sources + searchsploit for one service.
@@ -973,24 +1130,34 @@ def lookup_service(port_data: dict, opts: LookupOptions) -> tuple[list, list, bo
     product = port_data.get("product", "")
     version = clean_version(port_data.get("version_raw", ""))
     cpe     = port_data.get("cpe", "")
+    hint    = os_hint(port_data)
+
+    # (vendor, product, version) lets NVD results be checked against NVD's own
+    # affected-version ranges, even for keyword matches
+    ctx = cpe_context(cpe)
+    if not ctx and cpe.startswith("cpe:2.3:a:") and version:
+        f = cpe.split(":")
+        if f[3] not in ("", "*") and f[4] not in ("", "*"):
+            ctx = (f[3], f[4], version)
 
     vulns: list[dict] = []
     seen:  set[str]   = set()
 
     def add(results):
         for r in results:
-            if r["cve"] not in seen:
-                seen.add(r["cve"])
-                vulns.append(r)
+            if r["cve"] in seen or not platform_ok(r, hint):
+                continue
+            seen.add(r["cve"])
+            vulns.append({k: v for k, v in r.items() if k != "platforms"})
 
     # ── NVD lookup ─────────────────────────────────────────────────────────
     # A CPE without a version would match every CVE the product ever had,
     # so only use it when it is version-specific; otherwise fall back to
     # a keyword search.
     if cpe and cpe_has_version(cpe):
-        add(nvd_search_by_cpe(cpe, nvd_key=opts.nvd_key))
+        add(nvd_search_by_cpe(cpe, nvd_key=opts.nvd_key, ctx=ctx))
     if not vulns and product and version and not STOP.is_set():
-        add(nvd_search_by_keyword(f"{product} {version}", nvd_key=opts.nvd_key))
+        add(nvd_search_by_keyword(f"{product} {version}", nvd_key=opts.nvd_key, ctx=ctx))
 
     # ── OSV lookup ─────────────────────────────────────────────────────────
     if opts.use_osv and product and version and not STOP.is_set():
@@ -1049,6 +1216,13 @@ def _host_sort_key(ip: str):
     except ValueError:
         return (9, 0)
 
+def _can_retry_pn(target: str, port_range: str | None, arguments: str) -> bool:
+    """Retry with -Pn only for one explicit host (a -Pn sweep of a whole range
+    would be slow and noisy) and not for full 65535-port scans."""
+    args = shlex.split(arguments)
+    return (len(shlex.split(target)) == 1 and not re.search(r"[/,]|\d-\d", target)
+            and port_range != "1-65535" and "-Pn" not in args and "-sn" not in args)
+
 def scan(target: str, port_range: str | None = "1-1024",
          arguments: str = "-sV --version-intensity 7") -> dict:
     nm = nmap.PortScanner()
@@ -1056,18 +1230,31 @@ def scan(target: str, port_range: str | None = "1-1024",
           f"ports={cyan(port_range or 'nmap --top-ports')}")
     print(dim(f"  nmap {arguments}" + (f" -p {port_range}" if port_range else "")))
 
+    def run(args: str):
+        status.start(f"nmap scanning {target}")
+        try:
+            nm.scan(hosts=target, ports=port_range, arguments=args)
+        except nmap.PortScannerError as exc:
+            status.stop()
+            print(red(f"[!] nmap error: {str(exc).strip()}"))
+            print(yellow("    → Options like -O and SYN/UDP scans need root: try sudo "
+                         "(or an Administrator terminal on Windows)."))
+            sys.exit(1)
+        finally:
+            status.stop()
+
     started = time.monotonic()
-    status.start(f"nmap scanning {target}")
-    try:
-        nm.scan(hosts=target, ports=port_range, arguments=arguments)
-    except nmap.PortScannerError as exc:
-        status.stop()
-        print(red(f"[!] nmap error: {str(exc).strip()}"))
-        print(yellow("    → Options like -O and SYN/UDP scans need root: try sudo "
-                     "(or an Administrator terminal on Windows)."))
-        sys.exit(1)
-    finally:
-        status.stop()
+    run(arguments)
+
+    # Many hosts (and every TryHackMe / Hack The Box machine at times) drop the
+    # discovery probes, so nmap reports "0 hosts up" without scanning anything.
+    pn_retry = False
+    if not nm.all_hosts() and _can_retry_pn(target, port_range, arguments):
+        print(yellow("  ! No reply to host discovery — retrying once with -Pn "
+                     "(treat the host as up)"))
+        arguments += " -Pn"
+        pn_retry = True
+        run(arguments)
     elapsed = time.monotonic() - started
 
     results = {
@@ -1082,14 +1269,14 @@ def scan(target: str, port_range: str | None = "1-1024",
 
     for host in sorted(nm.all_hosts(), key=_host_sort_key):
         h = nm[host]
-        os_matches = [{"name": m.get("name", ""), "accuracy": m.get("accuracy", "")}
+        os_matches = [{"name": clean_text(m.get("name", "")), "accuracy": clean_text(m.get("accuracy", ""))}
                       for m in h.get("osmatch", [])[:3]]
         host_info = {
             "ip":       host,
-            "hostname": h.hostname() or "N/A",
+            "hostname": clean_text(h.hostname()) or "N/A",
             "state":    h.state(),
-            "mac":      h.get("addresses", {}).get("mac", ""),
-            "vendor":   next(iter(h.get("vendor", {}).values()), ""),
+            "mac":      clean_text(h.get("addresses", {}).get("mac", "")),
+            "vendor":   clean_text(next(iter(h.get("vendor", {}).values()), "")),
             "os":       os_matches,
             "ports":    [],
         }
@@ -1098,11 +1285,11 @@ def scan(target: str, port_range: str | None = "1-1024",
                 p = h[proto][port]
                 if p["state"] != "open":
                     continue
-                service   = p.get("name",    "unknown")
-                product   = p.get("product", "")
-                version   = p.get("version", "")
-                extrainfo = p.get("extrainfo","")
-                cpe       = normalize_cpe(p.get("cpe", ""), product, version)
+                service   = clean_text(p.get("name",    "unknown"))
+                product   = clean_text(p.get("product", ""))
+                version   = clean_text(p.get("version", ""))
+                extrainfo = clean_text(p.get("extrainfo", ""))
+                cpe       = normalize_cpe(clean_text(p.get("cpe", "")), product, version)
 
                 display_version = " ".join(filter(None, [product, version, extrainfo]))
                 host_info["ports"].append({
@@ -1119,6 +1306,10 @@ def scan(target: str, port_range: str | None = "1-1024",
                     "exploits":    [],
                 })
         results["hosts"].append(host_info)
+
+    if pn_retry:  # with -Pn nmap calls every host "up"; keep those that really answered
+        results["pn_retry"] = True
+        results["hosts"] = [h for h in results["hosts"] if h["ports"]]
 
     n_ports = sum(len(h["ports"]) for h in results["hosts"])
     print(f"  {green('✓')} nmap finished in {bold(fmt_duration(elapsed))} — "
@@ -1140,6 +1331,13 @@ def enrich_results(results: dict, opts: LookupOptions | None = None, workers: in
     all_ports = [p for h in results["hosts"] for p in h["ports"]]
     if not all_ports:
         return True
+
+    # A host runs one OS, even if only one of its banners names it
+    for h in results["hosts"]:
+        host_hint = (next((x for x in (os_hint(p) for p in h["ports"]) if x), "")
+                     or _banner_hint((h.get("os") or [{}])[0].get("name", "")))
+        for p in h["ports"]:
+            p["os_hint"] = os_hint(p) or host_hint
 
     groups: dict[tuple, list[dict]] = {}
     for p in all_ports:
@@ -1324,8 +1522,13 @@ def print_results(results: dict, max_cves: int = 10, max_exploits: int = 10):
     print("═" * W)
 
     if not results["hosts"]:
-        print(yellow("  No hosts responded."))
-        print(dim("  Tip: hosts that block ping look down — add --nmap-args \"-Pn\"."))
+        if results.get("pn_retry"):
+            print(yellow("  Nothing answered, even with -Pn."))
+            print(dim("  Check the IP is current and reachable (VPN connected? lab machine "
+                      "restarted with a new IP?), or that its ports are in the scanned range."))
+        else:
+            print(yellow("  No hosts responded."))
+            print(dim("  Tip: hosts that block ping look down — add --nmap-args \"-Pn\"."))
         return
 
     ver_w    = max(24, W - 58)
@@ -1478,27 +1681,39 @@ def save_json(results: dict, path: str):
 CSV_FIELDS = ["host", "hostname", "port", "proto", "service", "version", "finding",
               "id", "severity", "cvss", "epss", "kev", "source", "published", "title", "url"]
 
+def csv_safe(value):
+    """Spreadsheets run cells starting with = + - @ as formulas, and hostnames,
+    banners and advisory texts are not under our control — prefix such cells
+    with an apostrophe so they stay text."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
 def save_csv(results: dict, path: str):
     """One row per finding (CVE or exploit); ports without findings get one
     'open-port' row, so the CSV doubles as a service inventory."""
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        w.writeheader()
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+
+        def write(row: dict):
+            writer.writerow({k: csv_safe(v) for k, v in row.items()})
+
         for h in results["hosts"]:
             for p in h["ports"]:
                 base = {"host": h["ip"], "hostname": h["hostname"], "port": p["port"],
                         "proto": p["proto"], "service": p["service"], "version": p["version"]}
                 for v in p["live_vulns"]:
-                    w.writerow({**base, "finding": "cve", "id": v["cve"],
-                                "severity": v["severity"], "cvss": v["cvss"],
-                                "epss": v.get("epss", ""), "kev": "yes" if v.get("kev") else "",
-                                "source": v["source"], "published": v.get("published", ""),
-                                "title": v["description"], "url": vuln_url(v)})
+                    write({**base, "finding": "cve", "id": v["cve"],
+                           "severity": v["severity"], "cvss": v["cvss"],
+                           "epss": v.get("epss", ""), "kev": "yes" if v.get("kev") else "",
+                           "source": v["source"], "published": v.get("published", ""),
+                           "title": v["description"], "url": vuln_url(v)})
                 for e in p["exploits"]:
-                    w.writerow({**base, "finding": "exploit", "id": f"EDB-{e['edb_id']}",
-                                "source": "Exploit-DB", "title": e["title"], "url": e["url"]})
+                    write({**base, "finding": "exploit", "id": f"EDB-{e['edb_id']}",
+                           "source": "Exploit-DB", "title": e["title"], "url": e["url"]})
                 if not p["live_vulns"] and not p["exploits"]:
-                    w.writerow({**base, "finding": "open-port"})
+                    write({**base, "finding": "open-port"})
     print(green(f"  [+] CSV report saved  → {path}"))
 
 HTML_CSS = """
@@ -1882,6 +2097,10 @@ Examples:
             parser.error(f"cannot read target list: {e}")
     if not targets:
         parser.error("no target given (pass one or more targets, or -iL FILE)")
+    bad = next((t for t in targets if t.startswith("-")), None)
+    if bad:
+        parser.error(f"invalid target {bad!r}: targets can't start with '-' "
+                     "(nmap would read it as an option)")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
 

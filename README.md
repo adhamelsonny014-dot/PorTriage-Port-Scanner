@@ -67,6 +67,9 @@ A version scan gives you a list of services. Turning that into "what do I patch 
   - A **"Fix first"** list ranks findings by KEV → CVSS → EPSS, and every host gets an overall **risk rating**
 - **Exploit discovery** via `searchsploit` (offline Exploit-DB mirror), with direct exploit-db.com links
 - **Smart CPE handling** — converts nmap's CPE 2.2 URIs to the CPE 2.3 format NVD requires, and builds CPEs for ~45 common products (Apache, nginx, OpenSSH, MySQL, Redis, Tomcat, …) when nmap does not report one
+- **Version-range checking** — results are verified against each CVE's own affected-version ranges instead of trusting a text or CPE match: NVD's version ranges and "only when running on Red Hat / Windows / …" conditions are evaluated against the detected version and OS, and distro advisories (OSV) are compared with Debian/Ubuntu version rules, so a CVE that only affects Apache 2.4.49–2.4.50 is not reported for 2.4.48
+- **Hostile-data safe** — banners, hostnames and advisory texts come from the scanned network, so control characters are stripped, HTML output is escaped and CSV cells that spreadsheets would run as formulas are neutralised
+- **Hosts that ignore ping** — if a single target answers no discovery probes, PorTriage retries once with `-Pn` automatically
 - **De-duplicated, CVSS-sorted results** with severity ratings (CRITICAL / HIGH / MEDIUM / LOW); CVSS v3 vectors from OSV are converted to base scores
 - **Fast enrichment**
   - Each distinct service is looked up **once**, even if it runs on many hosts (e.g. the same OpenSSH across a /24)
@@ -290,8 +293,10 @@ One row per finding (`cve`, `exploit`, or `open-port` for ports without findings
 ## Known limitations
 
 - Vulnerability matching is based on the product/version string nmap reports, so results can include **false positives** (or miss issues if the version is not detected). Always verify findings manually.
-- **Backported patches** are only detected for Ubuntu and Debian packages whose build nmap reports (e.g. `OpenSSH 8.2p1 Ubuntu 4ubuntu0.4`): PorTriage then checks OSV results against that exact package version, using the distro's own advisories. For other systems, NVD results and upstream-version matches may flag CVEs a distro has already patched.
-- OSV advisories are re-checked against their affected version ranges (Debian/Ubuntu version rules, epochs included). Records without usable version ranges are kept, so a few OSV results may still be broader than the real affected range.
+- **Backported patches** are only detected for Ubuntu and Debian packages whose build nmap reports (e.g. `OpenSSH 8.2p1 Ubuntu 4ubuntu0.4`): PorTriage then checks OSV results against that exact package version, using the distro's own advisories. NVD data describes upstream releases only, so on distro-patched hosts it can still flag CVEs the distro has already fixed.
+- Without a visible distro build, OSV distro advisories that only say "affected since the package existed" (`introduced: 0`) are not counted as evidence for an upstream version — NVD decides instead. This avoids false positives, at the cost of missing the rare CVE that only distro advisories list.
+- NVD's platform conditions ("only on Red Hat", …) are applied only when the host's OS is visible in a banner (e.g. `(Ubuntu)`), or in another port's banner on the same host. Otherwise such CVEs are kept.
+- Records without usable version data (e.g. NVD entries still awaiting analysis) cannot be checked and are kept.
 - Without an NVD key, the first scan of many different services is slow because of NVD's public rate limit (repeat services and re-scans are served from the cache).
 - Lookup results are cached for 24 h by default in `~/.cache/portriage/` (`%LOCALAPPDATA%` on Windows). Use `--no-cache` or `--cache-ttl` to change this.
 - `searchsploit` is a Linux/macOS tool; on Windows run the scanner from WSL to get Exploit-DB results.
