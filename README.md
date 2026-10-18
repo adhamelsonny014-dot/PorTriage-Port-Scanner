@@ -65,7 +65,7 @@ A version scan gives you a list of services. Turning that into "what do I patch 
   - [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) — flags CVEs known to be exploited in the wild (and those used in ransomware campaigns)
   - [FIRST EPSS](https://www.first.org/epss/) — the probability a CVE will be exploited in the next 30 days
   - A **"Fix first"** list ranks findings by KEV → CVSS → EPSS, and every host gets an overall **risk rating**
-- **Exploit discovery** via `searchsploit` (offline Exploit-DB mirror), with direct exploit-db.com links
+- **Exploit discovery** via `searchsploit` (offline Exploit-DB mirror), with direct exploit-db.com links; exploits whose titles name other versions (e.g. a 2.4.49 exploit for Apache 2.4.48) are filtered out
 - **Smart CPE handling** — converts nmap's CPE 2.2 URIs to the CPE 2.3 format NVD requires, and builds CPEs for ~45 common products (Apache, nginx, OpenSSH, MySQL, Redis, Tomcat, …) when nmap does not report one
 - **Version-range checking** — results are verified against each CVE's own affected-version ranges instead of trusting a text or CPE match: NVD's version ranges and "only when running on Red Hat / Windows / …" conditions are evaluated against the detected version and OS, and distro advisories (OSV) are compared with Debian/Ubuntu version rules, so a CVE that only affects Apache 2.4.49–2.4.50 is not reported for 2.4.48
 - **Hostile-data safe** — banners, hostnames and advisory texts come from the scanned network, so control characters are stripped, HTML output is escaped and CSV cells that spreadsheets would run as formulas are neutralised

@@ -1041,6 +1041,41 @@ def build_searchsploit_queries(product: str, version: str) -> list[str]:
         queries.append(product)
     return list(dict.fromkeys(queries))  # de-duplicate, keep order
 
+# Exploit-DB titles name the affected versions before " - ":
+#   "vsftpd 2.3.4 - Backdoor", "OpenSSH 2.3 < 7.7 - Username Enumeration",
+#   "OpenSSH < 6.6 SFTP - …", "Apache 2.4.x - …", "Apache 2.2.x/2.4.x - …"
+_EDB_VERSION = r"\d+(?:\.(?:\d+|x))*\.(?:\d+[a-z0-9]*|x)|\d+\.x"
+_EDB_RANGE   = re.compile(rf"(?:({_EDB_VERSION})\s*)?<\s*({_EDB_VERSION})")
+
+def _edb_matches(version: str, token: str) -> bool:
+    """'2.4.49' = that release; '2.4' / '2.4.x' = the whole series."""
+    token = token[:-2] if token.endswith(".x") else token
+    return (_nvd_vcmp(version, token) == 0
+            or (version.startswith(token) and version[len(token):][:1] in (".", "p")))
+
+def exploit_applies(title: str, version: str) -> bool:
+    """False when an Exploit-DB title names versions and *version* is none of
+    them. Titles without versions (or a service without one) are kept."""
+    if not version:
+        return True
+    head  = title.split(" - ", 1)[0]
+    found = False
+    for alt in head.split("/"):
+        rng = _EDB_RANGE.search(alt)
+        if rng:  # "A < B" means A up to and including B
+            found = True
+            lo, hi = rng.group(1), rng.group(2)
+            lo_ok = not lo or _edb_matches(version, lo) or _nvd_vcmp(version, lo.removesuffix(".x")) >= 0
+            hi_ok = _edb_matches(version, hi) or _nvd_vcmp(version, hi.removesuffix(".x")) <= 0
+            if lo_ok and hi_ok:
+                return True
+            continue
+        for token in re.findall(_EDB_VERSION, alt):
+            found = True
+            if _edb_matches(version, token):
+                return True
+    return not found
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SMART CPE BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1194,7 +1229,9 @@ def lookup_service(port_data: dict, opts: LookupOptions) -> tuple[list, list, bo
             if STOP.is_set():
                 break
             for exp in run_searchsploit(q):
-                if exp["title"] not in seen_titles:
+                # the series query ("Apache httpd 2.4") also returns exploits
+                # for other releases — keep only those naming this version
+                if exp["title"] not in seen_titles and exploit_applies(exp["title"], version):
                     seen_titles.add(exp["title"])
                     exploits.append(exp)
 
