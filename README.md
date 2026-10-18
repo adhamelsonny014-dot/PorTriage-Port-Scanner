@@ -256,7 +256,7 @@ One row per finding (`cve`, `exploit`, or `open-port` for ports without findings
 {
   "target": "192.168.1.1",
   "scan_time": "2026-10-01T12:00:00",
-  "nmap_args": "-sV --version-intensity 7 --open -T4",
+  "nmap_args": "-sV --version-intensity 7 -T4",
   "durations": { "nmap": 41.2, "enrichment": 18.7 },
   "complete": true,
   "hosts": [
@@ -294,8 +294,8 @@ One row per finding (`cve`, `exploit`, or `open-port` for ports without findings
 
 - Vulnerability matching is based on the product/version string nmap reports, so results can include **false positives** (or miss issues if the version is not detected). Always verify findings manually.
 - **Backported patches** are only detected for Ubuntu and Debian packages whose build nmap reports (e.g. `OpenSSH 8.2p1 Ubuntu 4ubuntu0.4`): PorTriage then checks OSV results against that exact package version, using the distro's own advisories. NVD data describes upstream releases only, so on distro-patched hosts it can still flag CVEs the distro has already fixed.
-- Without a visible distro build, OSV distro advisories that only say "affected since the package existed" (`introduced: 0`) are not counted as evidence for an upstream version — NVD decides instead. This avoids false positives, at the cost of missing the rare CVE that only distro advisories list.
-- NVD's platform conditions ("only on Red Hat", …) are applied only when the host's OS is visible in a banner (e.g. `(Ubuntu)`), or in another port's banner on the same host. Otherwise such CVEs are kept.
+- Without a visible distro build, OSV distro advisories are not counted as evidence for an upstream version when they only say "affected since the package existed" (`introduced: 0`) — and neither are their version lists, which are generated from that same range. NVD decides instead. This avoids false positives, at the cost of missing the rare CVE that only distro advisories list.
+- NVD's platform conditions ("only on Red Hat", …) are applied only when the port's own banner names its OS (e.g. `(Ubuntu)`). The OS is not inferred from other ports, because one IP can front several systems (NAT, containers); without it, such CVEs are kept.
 - Records without usable version data (e.g. NVD entries still awaiting analysis) cannot be checked and are kept.
 - Without an NVD key, the first scan of many different services is slow because of NVD's public rate limit (repeat services and re-scans are served from the cache).
 - Lookup results are cached for 24 h by default in `~/.cache/portriage/` (`%LOCALAPPDATA%` on Windows). Use `--no-cache` or `--cache-ttl` to change this.
